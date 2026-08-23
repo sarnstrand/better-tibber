@@ -21,6 +21,14 @@ CONF_REFRESH_TOKEN = "refresh_token"
 # --- polling ---------------------------------------------------------------
 SCAN_INTERVAL = timedelta(seconds=60)
 
+# How long a device's last-known payload keeps being served after the backend
+# stops returning it. Upstream requests for a single vehicle or charger time out
+# for a poll or two at a time; carrying the previous values across that gap keeps
+# the entity on its last reading instead of flapping to unavailable every few
+# minutes. Past the window the data is dropped, so a device that is genuinely
+# gone doesn't sit there frozen forever.
+STALE_GRACE = timedelta(minutes=15)
+
 # --- gizmo / device types (from me.home.gizmos[].type) ---------------------
 GIZMO_ELECTRIC_VEHICLE = "ELECTRIC_VEHICLE"
 GIZMO_EV_CHARGER = "EV_CHARGER"

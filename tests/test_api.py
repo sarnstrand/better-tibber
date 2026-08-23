@@ -18,6 +18,7 @@ from custom_components.tibber_app.api import (
     TibberApiError,
     TibberAppClient,
     TibberAuthError,
+    _has_content,
     _is_auth_error,
     _is_transient_error,
 )
@@ -83,6 +84,59 @@ class TestIsTransientError:
 
     def test_empty_list_returns_false(self):
         assert not _is_transient_error([])
+
+    def test_upstream_request_timeout(self):
+        assert _is_transient_error([{"message": "Request for vehicle timed out"}])
+
+    def test_operation_aborted(self):
+        assert _is_transient_error([{"message": "Operation aborted"}])
+
+    def test_upstream_5xx_in_extensions(self):
+        """The real shape seen on the wire: a nulled device with a 500 upstream."""
+        assert _is_transient_error(
+            [
+                {
+                    "message": "gRPC request ... aborted before start",
+                    "path": ["me", "vehicle_1"],
+                    "extensions": {"statusCode": 500, "code": "VEHICLE_ERROR"},
+                }
+            ]
+        )
+
+    def test_upstream_4xx_in_extensions_is_not_transient(self):
+        assert not _is_transient_error(
+            [{"message": "Bad request", "extensions": {"statusCode": 400}}]
+        )
+
+    def test_non_integer_status_code_ignored(self):
+        assert not _is_transient_error(
+            [{"message": "nope", "extensions": {"statusCode": "500"}}]
+        )
+
+    def test_transient_among_several(self):
+        assert _is_transient_error(
+            [
+                {"message": "Request for vehicle charger timed out"},
+                {"message": "Request for vehicle timed out"},
+            ]
+        )
+
+
+class TestHasContent:
+    def test_resolved_field(self):
+        assert _has_content({"me": {"id": "abc"}})
+
+    def test_all_fields_null(self):
+        assert not _has_content({"me": None})
+
+    def test_some_fields_null(self):
+        assert _has_content({"me": None, "other": {"x": 1}})
+
+    def test_empty_dict(self):
+        assert not _has_content({})
+
+    def test_missing_data(self):
+        assert not _has_content(None)
 
 
 # ---------------------------------------------------------------------------
@@ -356,6 +410,123 @@ class TestGqlGraphQLErrors:
                     )
                 with pytest.raises(TibberApiError, match="Breaker is open"):
                     await client.gql("{ ok }")
+
+    async def test_request_timeout_is_retried_and_named(self):
+        """A bare TimeoutError stringifies to nothing; the message must still say so."""
+        async with aiohttp.ClientSession() as session:
+            client = TibberAppClient(session, "u@test.com", "pass", token="tok")
+            with (
+                patch(_SLEEP, new=AsyncMock()),
+                aioresponses() as m,
+            ):
+                for _ in range(4):
+                    m.post(GQL_URL, exception=TimeoutError())
+                with pytest.raises(TibberApiError, match="TimeoutError"):
+                    await client.gql("{ me { id } }")
+
+    async def test_request_timeout_retries_then_succeeds(self):
+        async with aiohttp.ClientSession() as session:
+            client = TibberAppClient(session, "u@test.com", "pass", token="tok")
+            with (
+                patch(_SLEEP, new=AsyncMock()),
+                aioresponses() as m,
+            ):
+                m.post(GQL_URL, exception=TimeoutError())
+                m.post(GQL_URL, payload={"data": {"ok": True}})
+                result = await client.gql("{ ok }")
+
+        assert result == {"ok": True}
+
+    async def test_upstream_timeout_retries_then_succeeds(self):
+        """A per-device timeout with nothing usable is retried, not surfaced."""
+        async with aiohttp.ClientSession() as session:
+            client = TibberAppClient(session, "u@test.com", "pass", token="tok")
+            with (
+                patch(_SLEEP, new=AsyncMock()),
+                aioresponses() as m,
+            ):
+                m.post(
+                    GQL_URL,
+                    payload={
+                        "data": {"me": None},
+                        "errors": [{"message": "Request for vehicle timed out"}],
+                    },
+                )
+                m.post(GQL_URL, payload={"data": {"me": {"id": "abc"}}})
+                result = await client.gql("{ me { id } }", partial_ok=True)
+
+        assert result == {"me": {"id": "abc"}}
+
+    async def test_partial_response_is_returned_when_partial_ok(self):
+        """A poll keeps the fields that resolved instead of losing the whole poll."""
+        partial = {
+            "data": {"me": {"id": "abc", "vehicle_ev_1": None, "home_h1": {"x": 1}}},
+            "errors": [{"message": "Request for vehicle timed out"}],
+        }
+        async with aiohttp.ClientSession() as session:
+            client = TibberAppClient(session, "u@test.com", "pass", token="tok")
+            with aioresponses() as m:
+                m.post(GQL_URL, payload=partial)
+                result = await client.gql("{ me { id } }", partial_ok=True)
+
+        assert result == partial["data"]
+
+    async def test_partial_response_is_not_retried(self):
+        """Taking the partial result must not cost an extra request."""
+        async with aiohttp.ClientSession() as session:
+            client = TibberAppClient(session, "u@test.com", "pass", token="tok")
+            with aioresponses() as m:
+                m.post(
+                    GQL_URL,
+                    payload={
+                        "data": {"me": {"id": "abc"}},
+                        "errors": [{"message": "Request for vehicle timed out"}],
+                    },
+                )
+                await client.gql("{ me { id } }", partial_ok=True)
+                assert len(list(m.requests.values())[0]) == 1
+
+    async def test_partial_response_raises_without_partial_ok(self):
+        """Mutations must not mistake a partly-failed write for a successful one."""
+        async with aiohttp.ClientSession() as session:
+            client = TibberAppClient(session, "u@test.com", "pass", token="tok")
+            with (
+                patch(_SLEEP, new=AsyncMock()),
+                aioresponses() as m,
+            ):
+                for _ in range(4):
+                    m.post(
+                        GQL_URL,
+                        payload={
+                            "data": {"setVehicleSettings": {"id": "ev-1"}},
+                            "errors": [{"message": "Request for vehicle timed out"}],
+                        },
+                    )
+                with pytest.raises(TibberApiError, match="timed out"):
+                    await client.gql("mutation { setVehicleSettings { id } }")
+
+    async def test_partial_ok_still_raises_auth_error(self):
+        """An expired token must reach reauth even on a partly-resolved response."""
+        async with aiohttp.ClientSession() as session:
+            client = TibberAppClient(session, "u@test.com", "pass", token="old")
+            with aioresponses() as m:
+                m.post(
+                    GQL_URL,
+                    payload={
+                        "data": {"me": {"id": "abc"}},
+                        "errors": [{"extensions": {"code": "UNAUTHENTICATED"}}],
+                    },
+                )
+                m.post(LOGIN_URL, payload={"token": "new_tok"})
+                m.post(
+                    GQL_URL,
+                    payload={
+                        "data": {"me": {"id": "abc"}},
+                        "errors": [{"extensions": {"code": "UNAUTHENTICATED"}}],
+                    },
+                )
+                with pytest.raises(TibberAuthError):
+                    await client.gql("{ me { id } }", partial_ok=True)
 
     async def test_non_auth_graphql_error_raises_api_error(self):
         async with aiohttp.ClientSession() as session:

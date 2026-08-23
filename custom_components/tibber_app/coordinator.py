@@ -9,6 +9,7 @@ meter sensors update in near real time.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import timedelta as _timedelta
 from typing import Any
@@ -30,6 +31,7 @@ from .const import (
     GIZMO_REAL_TIME_METER,
     GIZMO_THERMOSTAT,
     SCAN_INTERVAL,
+    STALE_GRACE,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -120,6 +122,9 @@ class TibberDataUpdateCoordinator(DataUpdateCoordinator[TibberData]):
         # Preserve live WS data across polls.
         self._live: dict[str, dict[str, Any]] = {}
         self._battery_live: dict[str, dict[str, Any]] = {}
+        # Last-known node per home/device, with the monotonic time it arrived.
+        # Used to bridge polls where the backend nulls a device out; see _fresh().
+        self._last_seen: dict[str, tuple[dict[str, Any], float]] = {}
 
     # -- discovery ----------------------------------------------------------
     async def async_discover(self) -> None:
@@ -165,7 +170,7 @@ class TibberDataUpdateCoordinator(DataUpdateCoordinator[TibberData]):
         for home_id in self.home_titles:
             try:
                 res = await self.client.gql(
-                    queries.GRID_REWARDS_HISTORY, {"homeId": home_id}
+                    queries.GRID_REWARDS_HISTORY, {"homeId": home_id}, partial_ok=True
                 )
             except TibberApiError:
                 continue
@@ -214,6 +219,7 @@ class TibberDataUpdateCoordinator(DataUpdateCoordinator[TibberData]):
                         "to": next_month.isoformat(),
                         "resolution": "monthly",
                     },
+                    partial_ok=True,
                 )
             except TibberApiError as err:
                 _LOGGER.debug("Grid rewards fetch failed for %s: %s", home_id, err)
@@ -227,8 +233,14 @@ class TibberDataUpdateCoordinator(DataUpdateCoordinator[TibberData]):
     # -- polling ------------------------------------------------------------
     async def _async_update_data(self) -> TibberData:
         query = self._build_query()
+        # The first poll decides which entities exist (number.py reads the
+        # vehicle's canReadLevel to pick the manual-SoC entity), so it has to be
+        # complete — a partial one here would bake a gap in until the next
+        # reload. Failing instead leaves HA to retry setup. Later polls take
+        # whatever resolved and carry the rest over.
+        first = self.data is None
         try:
-            raw = await self.client.gql(query)
+            raw = await self.client.gql(query, partial_ok=not first)
         except TibberAuthError as err:
             raise ConfigEntryAuthFailed(f"Authentication failed: {err}") from err
         except TibberApiError as err:
@@ -269,8 +281,50 @@ class TibberDataUpdateCoordinator(DataUpdateCoordinator[TibberData]):
 
         return "{ me { " + "\n".join(me_parts) + " } }"
 
+    def _fresh(
+        self, key: str, node: dict[str, Any] | None, now: float
+    ) -> dict[str, Any] | None:
+        """Return ``node``, or the last-known one when this poll didn't carry it.
+
+        The backend answers a partly-failed query with the timed-out field set to
+        null and everything else intact, so a device dropping out of one poll says
+        nothing about the device — only about that request. Reusing the previous
+        payload for up to ``STALE_GRACE`` keeps the entity on its last reading;
+        after that it's dropped so a device that really went away stops reporting.
+        """
+        if node:
+            self._last_seen[key] = (node, now)
+            return node
+        cached = self._last_seen.get(key)
+        if cached is None:
+            return None
+        previous, seen_at = cached
+        if now - seen_at > STALE_GRACE.total_seconds():
+            del self._last_seen[key]
+            return None
+        _LOGGER.debug("%s missing from this poll, reusing last known values", key)
+        return previous
+
+    def stale_ages(self) -> dict[str, int]:
+        """Seconds since each home/device last came back in a poll.
+
+        Everything is refreshed every poll, so a non-trivial age here means that
+        node has been timing out upstream — which is what to look at when an
+        entity is holding a value longer than it should. Labelled by device name
+        and home position so the result can be shared without leaking ids.
+        """
+        now = time.monotonic()
+        labels = {d.id: d.name for d in self.devices}
+        labels |= {hid: str(n) for n, hid in enumerate(self.home_titles, 1)}
+        ages: dict[str, int] = {}
+        for key, (_, seen_at) in self._last_seen.items():
+            kind, _, ident = key.partition(" ")
+            ages[f"{kind} {labels.get(ident, '?')}"] = int(now - seen_at)
+        return ages
+
     def _parse(self, raw: dict[str, Any]) -> TibberData:
         me = raw.get("me") or {}
+        now = time.monotonic()
         data = TibberData(
             live=dict(self._live),
             battery_live=dict(self._battery_live),
@@ -278,12 +332,16 @@ class TibberDataUpdateCoordinator(DataUpdateCoordinator[TibberData]):
         )
 
         for dev in self.devices_of_type(GIZMO_ELECTRIC_VEHICLE):
-            node = me.get(_alias("vehicle", dev.id))
+            node = self._fresh(
+                f"vehicle {dev.id}", me.get(_alias("vehicle", dev.id)), now
+            )
             if node:
                 data.vehicles[dev.id] = node
 
         for home_id in self.home_titles:
-            home_node = me.get(_alias("home", home_id))
+            home_node = self._fresh(
+                f"home {home_id}", me.get(_alias("home", home_id)), now
+            )
             if not home_node:
                 continue
             data.homes[home_id] = {
@@ -295,22 +353,25 @@ class TibberDataUpdateCoordinator(DataUpdateCoordinator[TibberData]):
                 "gridRewards": self._grid_rewards.get(home_id),
                 "weather": home_node.get("weather"),
             }
-            for dev in self.devices_of_type(GIZMO_EV_CHARGER):
-                node = home_node.get(_alias("charger", dev.id))
-                if node:
-                    data.chargers[dev.id] = node
-            for dev in self.devices_of_type(GIZMO_BATTERY):
-                node = home_node.get(_alias("battery", dev.id))
-                if node:
-                    data.batteries[dev.id] = node
-            for dev in self.devices_of_type(GIZMO_INVERTER):
-                node = home_node.get(_alias("inverter", dev.id))
-                if node:
-                    data.inverters[dev.id] = node
-            for dev in self.devices_of_type(GIZMO_THERMOSTAT):
-                node = home_node.get(_alias("thermostat", dev.id))
-                if node:
-                    data.thermostats[dev.id] = node
+            for gtype, prefix, bucket in (
+                (GIZMO_EV_CHARGER, "charger", data.chargers),
+                (GIZMO_BATTERY, "battery", data.batteries),
+                (GIZMO_INVERTER, "inverter", data.inverters),
+                (GIZMO_THERMOSTAT, "thermostat", data.thermostats),
+            ):
+                for dev in self.devices_of_type(gtype):
+                    # Only this home's devices are selected into its block, so
+                    # skipping the rest keeps _fresh() from treating a device
+                    # that was never asked for here as one that dropped out.
+                    if dev.home_id != home_id:
+                        continue
+                    node = self._fresh(
+                        f"{prefix} {dev.id}",
+                        home_node.get(_alias(prefix, dev.id)),
+                        now,
+                    )
+                    if node:
+                        bucket[dev.id] = node
 
         return data
 
@@ -356,6 +417,7 @@ class TibberDataUpdateCoordinator(DataUpdateCoordinator[TibberData]):
                         "to": now.isoformat(),
                         "resolution": "HOURLY",
                     },
+                    partial_ok=True,
                 )
             except TibberApiError as err:
                 _LOGGER.debug(

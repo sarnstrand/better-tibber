@@ -26,5 +26,7 @@ async def async_get_config_entry_diagnostics(
         "homes": len(coordinator.home_titles),
         "devices": [{"type": d.type, "name": d.name} for d in coordinator.devices],
         "grid_reward_homes": len(coordinator.grid_reward_homes),
+        "last_update_success": coordinator.last_update_success,
+        "seconds_since_last_seen": coordinator.stale_ages(),
         "data": async_redact_data(asdict(data) if data else {}, _REDACT),
     }

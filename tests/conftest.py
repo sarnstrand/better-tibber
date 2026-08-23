@@ -106,7 +106,9 @@ def config_entry() -> MockConfigEntry:
 def _gql_dispatcher(discovery_data: dict, poll_data: dict):
     """Build a side_effect function that routes GQL calls to the right fixture."""
 
-    async def _gql(query: str, variables: dict | None = None) -> dict:
+    async def _gql(
+        query: str, variables: dict | None = None, *, partial_ok: bool = False
+    ) -> dict:
         if "gizmos" in query:
             return discovery_data
         if "gridRewardsHistory" in query:

@@ -17,6 +17,11 @@ from .const import GQL_URL, LOGIN_URL, USER_AGENT, WS_URL
 
 _LOGGER = logging.getLogger(__name__)
 
+# Per-attempt ceiling. Healthy responses land in about a second, so this only
+# catches a genuinely stuck connection — and it has to stay well under the poll
+# interval so a hung request can't push the next poll past its slot.
+_REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30)
+
 # graphql-transport-ws message types
 _WS_CONNECTION_INIT = "connection_init"
 _WS_CONNECTION_ACK = "connection_ack"
@@ -38,15 +43,44 @@ def _is_auth_error(errors: list[dict[str, Any]]) -> bool:
     return False
 
 
+# Backend hiccups arrive as GraphQL errors on an HTTP 200 rather than as a 5xx:
+# the gateway's own circuit breaker, an upstream device service not answering in
+# time ("Request for vehicle timed out"), and its gRPC call falling over
+# ("Operation aborted", "... aborted before start"). All are momentary, so they
+# get the same backoff a 5xx would.
+_TRANSIENT_ERROR_MARKERS = ("breaker is open", "timed out", "aborted")
+
+
 def _is_transient_error(errors: list[dict[str, Any]]) -> bool:
     """True if a GraphQL error list signals a transient upstream failure.
 
-    The backend trips its own circuit breaker under load and returns this as a
-    GraphQL error (HTTP 200) rather than a 5xx, so it needs the same backoff.
+    Prefers the structured signal: these carry the upstream's HTTP status in
+    ``extensions.statusCode`` (500 for a failed device call), which survives the
+    backend rewording its messages. The substrings are the fallback for errors
+    that arrive without extensions.
     """
-    return any(
-        "breaker is open" in (err.get("message") or "").lower() for err in errors
-    )
+    for err in errors:
+        status = (err.get("extensions") or {}).get("statusCode")
+        if isinstance(status, int) and status >= 500:
+            return True
+        message = (err.get("message") or "").lower()
+        if any(marker in message for marker in _TRANSIENT_ERROR_MARKERS):
+            return True
+    return False
+
+
+def _has_content(data: Any) -> bool:
+    """True if a GraphQL ``data`` payload resolved to something beyond nulls.
+
+    A field-level failure nulls out just that field and leaves the rest of the
+    response intact; a whole-request failure nulls the top-level field instead.
+    """
+    return isinstance(data, dict) and any(v is not None for v in data.values())
+
+
+def _error_summary(errors: list[dict[str, Any]]) -> str:
+    """Join GraphQL error messages for logging."""
+    return "; ".join(e.get("message", "?") for e in errors)
 
 
 class TibberAuthError(Exception):
@@ -90,6 +124,7 @@ class TibberAppClient:
                     LOGIN_URL,
                     json={"email": self._email, "password": self._password},
                     headers={"Content-Type": "application/json"},
+                    timeout=_REQUEST_TIMEOUT,
                 ) as resp:
                     if resp.status in (401, 403):
                         raise TibberAuthError("Invalid email or password")
@@ -97,8 +132,10 @@ class TibberAppClient:
                     data = await resp.json()
             except aiohttp.ClientResponseError as err:
                 raise TibberAuthError(f"Login failed: {err.status}") from err
-            except aiohttp.ClientError as err:
-                raise TibberApiError(f"Login request failed: {err}") from err
+            except (aiohttp.ClientError, TimeoutError) as err:
+                raise TibberApiError(
+                    f"Login request failed: {str(err) or type(err).__name__}"
+                ) from err
 
             token = data.get("token")
             if not token:
@@ -117,11 +154,18 @@ class TibberAppClient:
         query: str,
         variables: dict[str, Any] | None = None,
         retries: int = 4,
+        *,
+        partial_ok: bool = False,
     ) -> dict[str, Any]:
         """Execute a GraphQL request, returning the parsed ``data`` payload.
 
         Handles 401 (re-login once), 429 rate limiting (hard backoff) and transient
         5xx errors with exponential backoff.
+
+        With ``partial_ok`` a response that carries both errors and usable data is
+        returned instead of raising. Reads want that — one device's upstream
+        timing out should not discard the rest of the poll — while mutations do
+        not, since a swallowed error there would look like a successful write.
         """
         body: dict[str, Any] = {"query": query}
         if variables is not None:
@@ -140,6 +184,7 @@ class TibberAppClient:
                         "Authorization": f"Bearer {token}",
                         "User-Agent": USER_AGENT,
                     },
+                    timeout=_REQUEST_TIMEOUT,
                 ) as resp:
                     if resp.status == 401 and not relogged:
                         relogged = True
@@ -159,11 +204,13 @@ class TibberAppClient:
                 if err.status == 401:
                     raise TibberAuthError("Token rejected") from err
                 raise TibberApiError(f"HTTP {err.status}") from err
-            except aiohttp.ClientError as err:
+            except (aiohttp.ClientError, TimeoutError) as err:
                 if attempt < retries - 1:
                     await asyncio.sleep(2 * (attempt + 1))
                     continue
-                raise TibberApiError(f"Request failed: {err}") from err
+                raise TibberApiError(
+                    f"Request failed: {str(err) or type(err).__name__}"
+                ) from err
 
             errors = payload.get("errors")
             if errors:
@@ -176,11 +223,17 @@ class TibberAppClient:
                         token = await self.login()
                         continue
                     raise TibberAuthError("Token rejected after re-login")
+                data = payload.get("data")
+                if partial_ok and _has_content(data):
+                    _LOGGER.debug(
+                        "Partial GraphQL response, keeping what resolved: %s",
+                        _error_summary(errors),
+                    )
+                    return data
                 if _is_transient_error(errors) and attempt < retries - 1:
                     await asyncio.sleep(2 * (attempt + 1))
                     continue
-                msg = "; ".join(e.get("message", "?") for e in errors)
-                raise TibberApiError(f"GraphQL error: {msg}")
+                raise TibberApiError(f"GraphQL error: {_error_summary(errors)}")
             return payload.get("data", {})
 
         raise TibberApiError("max retries exceeded")

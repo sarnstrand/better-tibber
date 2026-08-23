@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
@@ -14,6 +14,7 @@ from custom_components.tibber_app.const import (
     GIZMO_ELECTRIC_VEHICLE,
     GIZMO_EV_CHARGER,
     GIZMO_REAL_TIME_METER,
+    STALE_GRACE,
 )
 from custom_components.tibber_app.coordinator import (
     TibberData,
@@ -26,7 +27,7 @@ _ENTRY_DATA = {CONF_EMAIL: "t@t.com", CONF_PASSWORD: "x", CONF_TOKEN: "y"}
 
 
 def _make_coordinator(hass, discovery_data: dict, poll_data: dict):
-    async def _gql(query: str, variables=None):
+    async def _gql(query: str, variables=None, *, partial_ok: bool = False):
         if "gizmos" in query:
             return discovery_data
         if "gridRewardsHistory" in query:
@@ -236,6 +237,129 @@ class TestParse:
         coord._live = {"pulse-1": {"power": 500.0}}
         data = coord._parse(poll_data)
         assert data.live["pulse-1"]["power"] == 500.0
+
+
+class TestStaleCarryForward:
+    """A device nulled out by a timed-out upstream keeps its last known values."""
+
+    def _coord(self, hass):
+        return TestParse()._coord_with_devices(hass)
+
+    def test_missing_vehicle_keeps_previous_values(self, hass, poll_data):
+        coord = self._coord(hass)
+        coord._parse(poll_data)
+
+        partial = {"me": dict(poll_data["me"], vehicle_ev_1=None)}
+        data = coord._parse(partial)
+
+        assert data.vehicles["ev-1"]["battery"]["level"] == 75
+
+    def test_missing_charger_keeps_previous_values(self, hass, poll_data):
+        coord = self._coord(hass)
+        coord._parse(poll_data)
+
+        home = dict(poll_data["me"]["home_home_1"], charger_charger_1=None)
+        data = coord._parse({"me": dict(poll_data["me"], home_home_1=home)})
+
+        assert data.chargers["charger-1"]["chargingStatus"] == "READY"
+
+    def test_missing_home_keeps_previous_values(self, hass, poll_data):
+        coord = self._coord(hass)
+        coord._parse(poll_data)
+
+        data = coord._parse({"me": dict(poll_data["me"], home_home_1=None)})
+
+        assert data.homes["home-1"]["consumption"]["consumption"] == 150.0
+        # The home's devices ride along on the cached home node.
+        assert data.chargers["charger-1"]["chargingStatus"] == "READY"
+
+    def test_fresh_value_replaces_cached_one(self, hass, poll_data):
+        coord = self._coord(hass)
+        coord._parse(poll_data)
+        coord._parse({"me": dict(poll_data["me"], vehicle_ev_1=None)})
+
+        updated = {"me": dict(poll_data["me"])}
+        updated["me"]["vehicle_ev_1"] = dict(
+            poll_data["me"]["vehicle_ev_1"], chargingStatus="CHARGING"
+        )
+        data = coord._parse(updated)
+
+        assert data.vehicles["ev-1"]["chargingStatus"] == "CHARGING"
+
+    def test_dropped_after_grace_period(self, hass, poll_data):
+        """Past the window the device stops reporting rather than freezing."""
+        coord = self._coord(hass)
+        with patch(
+            "custom_components.tibber_app.coordinator.time.monotonic",
+            return_value=1000.0,
+        ):
+            coord._parse(poll_data)
+
+        partial = {"me": dict(poll_data["me"], vehicle_ev_1=None)}
+        later = 1000.0 + STALE_GRACE.total_seconds() + 1
+        with patch(
+            "custom_components.tibber_app.coordinator.time.monotonic",
+            return_value=later,
+        ):
+            data = coord._parse(partial)
+
+        assert "ev-1" not in data.vehicles
+        # And the expired entry is not kept around for the next poll either.
+        assert "vehicle ev-1" not in coord._last_seen
+
+    def test_never_seen_device_is_absent(self, hass, poll_data):
+        coord = self._coord(hass)
+        data = coord._parse({"me": dict(poll_data["me"], vehicle_ev_1=None)})
+        assert "ev-1" not in data.vehicles
+
+
+class TestStaleAges:
+    def test_labels_by_device_name_and_home_position(self, hass, poll_data):
+        coord = TestParse()._coord_with_devices(hass)
+        coord._parse(poll_data)
+
+        ages = coord.stale_ages()
+
+        assert set(ages) == {"vehicle My Car", "charger My Charger", "home 1"}
+        assert all(age == 0 for age in ages.values())
+
+    def test_age_grows_while_a_device_is_missing(self, hass, poll_data):
+        coord = TestParse()._coord_with_devices(hass)
+        monotonic = "custom_components.tibber_app.coordinator.time.monotonic"
+        with patch(monotonic, return_value=100.0):
+            coord._parse(poll_data)
+        with patch(monotonic, return_value=280.0):
+            coord._parse({"me": dict(poll_data["me"], vehicle_ev_1=None)})
+            ages = coord.stale_ages()
+
+        assert ages["vehicle My Car"] == 180
+        assert ages["home 1"] == 0
+
+
+class TestPollTolerance:
+    """Partial responses are accepted, but not for the entity-creating first poll."""
+
+    def _coord(self, hass, gql):
+        client = MagicMock()
+        client.gql = gql
+        entry = MockConfigEntry(domain=DOMAIN, data=_ENTRY_DATA, unique_id="acc-1")
+        coord = TibberDataUpdateCoordinator(hass, entry, client)
+        coord.home_titles = {"home-1": "My Home"}
+        coord.devices = []
+        return coord
+
+    async def test_first_poll_demands_a_complete_response(self, hass, poll_data):
+        gql = AsyncMock(return_value=poll_data)
+        coord = self._coord(hass, gql)
+        await coord._async_update_data()
+        assert gql.await_args.kwargs["partial_ok"] is False
+
+    async def test_later_polls_accept_partial_responses(self, hass, poll_data):
+        gql = AsyncMock(return_value=poll_data)
+        coord = self._coord(hass, gql)
+        coord.data = await coord._async_update_data()
+        await coord._async_update_data()
+        assert gql.await_args.kwargs["partial_ok"] is True
 
 
 class TestLiveUpdate:
