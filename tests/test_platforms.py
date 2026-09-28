@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from datetime import time as dt_time
 from unittest.mock import AsyncMock, patch
 
 from homeassistant.helpers import entity_registry as er
 
 from custom_components.tibber_app.const import DOMAIN
+from custom_components.tibber_app.vehicle_settings import parse_departure_time
 
 
 def _eid(hass, entry, platform: str, suffix: str) -> str:
@@ -217,6 +219,16 @@ class TestPreferredVehicleSelect:
 
 
 class TestDepartureTimeEntities:
+    def test_departure_time_parser_accepts_only_valid_hh_mm(self):
+        assert parse_departure_time("00:00") == dt_time(0, 0)
+        assert parse_departure_time("7:00") == dt_time(7, 0)
+        assert parse_departure_time("23:59") == dt_time(23, 59)
+        for value in (None, "No departure time", "24:00", "12:60"):
+            assert parse_departure_time(value) is None
+
+    async def test_clear_action_is_registered(self, hass, setup_integration):
+        assert hass.services.has_service(DOMAIN, "clear_departure_times")
+
     async def test_monday_departure_reads_user_settings(self, hass, setup_integration):
         """departure_monday reads '07:00' from userSettings → state '07:00:00'."""
         state = hass.states.get(
@@ -297,6 +309,109 @@ class TestDepartureTimeEntities:
         assert setting["key"] == "online.vehicle.smartCharging.departureTimes.monday"
         assert setting["value"] == "08:30"
 
+    async def test_clear_action_sends_explicit_null_for_selected_entity(
+        self, hass, setup_integration
+    ):
+        coordinator = setup_integration.runtime_data.coordinator
+        coordinator.async_request_refresh = AsyncMock()
+        mutation_mock = AsyncMock(return_value={})
+
+        with patch.object(coordinator.client, "gql", new=mutation_mock):
+            await hass.services.async_call(
+                DOMAIN,
+                "clear_departure_times",
+                {
+                    "entity_id": _eid(
+                        hass, setup_integration, "time", "ev-1_departure_monday"
+                    )
+                },
+                blocking=True,
+            )
+
+        mutation_mock.assert_called_once()
+        _, variables = mutation_mock.call_args.args
+        assert variables["vehicleId"] == "ev-1"
+        assert variables["homeId"] == "home-1"
+        assert variables["settings"] == [
+            {
+                "key": "offline.vehicle.departureTimes.monday",
+                "value": None,
+            }
+        ]
+        coordinator.async_request_refresh.assert_called_once()
+
+    async def test_clear_action_handles_multiple_selected_days(
+        self, hass, connected_vehicle_poll_data, setup_integration
+    ):
+        coordinator = setup_integration.runtime_data.coordinator
+        for setting in coordinator.data.vehicles["ev-1"]["userSettings"]:
+            if setting["key"].endswith(".tuesday"):
+                setting["value"] = "08:00"
+        coordinator.async_request_refresh = AsyncMock()
+        mutation_mock = AsyncMock(return_value={})
+
+        with patch.object(coordinator.client, "gql", new=mutation_mock):
+            await hass.services.async_call(
+                DOMAIN,
+                "clear_departure_times",
+                {
+                    "entity_id": [
+                        _eid(
+                            hass,
+                            setup_integration,
+                            "time",
+                            "ev-1_departure_monday",
+                        ),
+                        _eid(
+                            hass,
+                            setup_integration,
+                            "time",
+                            "ev-1_departure_tuesday",
+                        ),
+                    ]
+                },
+                blocking=True,
+            )
+
+        assert mutation_mock.await_count == 2
+        settings = sorted(
+            (call.args[1]["settings"][0] for call in mutation_mock.await_args_list),
+            key=lambda setting: setting["key"],
+        )
+        assert settings == [
+            {
+                "key": "online.vehicle.smartCharging.departureTimes.monday",
+                "value": None,
+            },
+            {
+                "key": "online.vehicle.smartCharging.departureTimes.tuesday",
+                "value": None,
+            },
+        ]
+        assert coordinator.async_request_refresh.await_count == 2
+
+    async def test_clear_action_skips_entity_without_departure_time(
+        self, hass, connected_vehicle_poll_data, setup_integration
+    ):
+        coordinator = setup_integration.runtime_data.coordinator
+        coordinator.async_request_refresh = AsyncMock()
+        mutation_mock = AsyncMock(return_value={})
+
+        with patch.object(coordinator.client, "gql", new=mutation_mock):
+            await hass.services.async_call(
+                DOMAIN,
+                "clear_departure_times",
+                {
+                    "entity_id": _eid(
+                        hass, setup_integration, "time", "ev-1_departure_tuesday"
+                    )
+                },
+                blocking=True,
+            )
+
+        mutation_mock.assert_not_awaited()
+        coordinator.async_request_refresh.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # button
@@ -324,3 +439,83 @@ class TestRefreshButton:
         )
 
         coordinator.async_request_refresh.assert_called_once()
+
+
+class TestClearAllDepartureTimesButton:
+    async def test_button_exists_for_vehicle_with_schedule(
+        self, hass, setup_integration
+    ):
+        eid = _eid(
+            hass, setup_integration, "button", "ev-1_clear_all_departure_times"
+        )
+        assert hass.states.get(eid) is not None
+
+    async def test_press_clears_only_scheduled_days_as_separate_nulls(
+        self, hass, connected_vehicle_poll_data, setup_integration
+    ):
+        coordinator = setup_integration.runtime_data.coordinator
+        for setting in coordinator.data.vehicles["ev-1"]["userSettings"]:
+            if setting["key"].endswith(".tuesday"):
+                setting["value"] = "08:00"
+        coordinator.async_request_refresh = AsyncMock()
+        mutation_mock = AsyncMock(return_value={})
+
+        with patch.object(coordinator.client, "gql", new=mutation_mock):
+            await hass.services.async_call(
+                "button",
+                "press",
+                {
+                    "entity_id": _eid(
+                        hass,
+                        setup_integration,
+                        "button",
+                        "ev-1_clear_all_departure_times",
+                    )
+                },
+                blocking=True,
+            )
+
+        assert mutation_mock.await_count == 2
+        settings = sorted(
+            (item.args[1]["settings"][0] for item in mutation_mock.await_args_list),
+            key=lambda setting: setting["key"],
+        )
+        assert settings == [
+            {
+                "key": "online.vehicle.smartCharging.departureTimes.monday",
+                "value": None,
+            },
+            {
+                "key": "online.vehicle.smartCharging.departureTimes.tuesday",
+                "value": None,
+            },
+        ]
+        coordinator.async_request_refresh.assert_called_once()
+
+    async def test_press_skips_week_when_all_days_are_empty(
+        self, hass, connected_vehicle_poll_data, setup_integration
+    ):
+        coordinator = setup_integration.runtime_data.coordinator
+        for setting in coordinator.data.vehicles["ev-1"]["userSettings"]:
+            if "departureTimes." in setting["key"]:
+                setting["value"] = "No departure time"
+        coordinator.async_request_refresh = AsyncMock()
+        mutation_mock = AsyncMock(return_value={})
+
+        with patch.object(coordinator.client, "gql", new=mutation_mock):
+            await hass.services.async_call(
+                "button",
+                "press",
+                {
+                    "entity_id": _eid(
+                        hass,
+                        setup_integration,
+                        "button",
+                        "ev-1_clear_all_departure_times",
+                    )
+                },
+                blocking=True,
+            )
+
+        mutation_mock.assert_not_awaited()
+        coordinator.async_request_refresh.assert_not_called()

@@ -12,12 +12,14 @@ from datetime import time as dt_time
 
 from homeassistant.components.time import TimeEntity
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_platform
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from . import TibberConfigEntry
 from .const import GIZMO_ELECTRIC_VEHICLE, VEHICLE_DEPARTURE_SUFFIX, WEEKDAYS
 from .coordinator import TibberDataUpdateCoordinator, TibberDevice
 from .entity import TibberEntity
+from .vehicle_settings import parse_departure_time
 
 PARALLEL_UPDATES = 0
 
@@ -28,6 +30,11 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Create a departure-time entity per weekday for each vehicle."""
+    platform = entity_platform.async_get_current_platform()
+    platform.async_register_entity_service(
+        "clear_departure_times", {}, "async_clear_departure_time"
+    )
+
     coordinator = entry.runtime_data.coordinator
     entities: list[TimeEntity] = []
     for dev in coordinator.devices_of_type(GIZMO_ELECTRIC_VEHICLE):
@@ -75,10 +82,7 @@ class TibberDepartureTime(TibberEntity, TimeEntity):
         key = self._setting_key
         for setting in node.get("userSettings") or []:
             if setting.get("key") == key:
-                raw = str(setting.get("value") or "")
-                parts = raw.split(":")
-                if len(parts) == 2 and all(p.isdigit() for p in parts):
-                    return dt_time(int(parts[0]), int(parts[1]))
+                return parse_departure_time(setting.get("value"))
         return None
 
     async def async_set_value(self, value: dt_time) -> None:
@@ -87,4 +91,12 @@ class TibberDepartureTime(TibberEntity, TimeEntity):
             self._device.home_id,
             self._setting_key,
             value.strftime("%H:%M"),
+        )
+
+    async def async_clear_departure_time(self) -> None:
+        """Clear this departure time through the standard entity action API."""
+        if self.native_value is None:
+            return
+        await self.coordinator.async_clear_vehicle_departure_times(
+            self._device.id, self._device.home_id, [self._setting_key]
         )

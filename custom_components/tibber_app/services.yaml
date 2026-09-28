@@ -1,0 +1,10 @@
+clear_departure_times:
+  name: Clear departure times
+  description: >-
+    Remove the Tibber Smart Charging departure time from the selected vehicle
+    departure-time entities. Entities that already have no departure time are
+    skipped.
+  target:
+    entity:
+      integration: tibber_app
+      domain: time

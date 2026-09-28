@@ -32,7 +32,7 @@ real-time meter, prices, and (where present) battery, solar and thermostats.
 
 | Device | Entities |
 |---|---|
-| **Vehicle** | battery %, range, charging/smart-charging status, session energy, session cost, target charge/departure · online + charging binary sensors · **manual state-of-charge number** (only where Tibber can't read the level itself) · **smart-charging switch** · **weekly departure schedule** (see below) |
+| **Vehicle** | battery %, range, charging/smart-charging status, session energy, session cost, target charge/departure · online + charging binary sensors · **manual state-of-charge number** (only where Tibber can't read the level itself) · **smart-charging switch** · **weekly departure schedule and clear-all button** (see below) |
 | **Charger** | charging status, last seen, active vehicle · online binary sensor · **preferred-vehicle select** · permanent-cable-lock & fuse-load-balancing switches · max-current / main-fuse / offline-fallback numbers |
 | **Pulse (live)** | power, production, phase currents/voltages, consumption/production/cost today, signal · online* / peak-exceeded binary sensors |
 | **Home** | electricity price (+ today/tomorrow arrays), consumption & cost this month · Grid Rewards this month (where available) · **hourly forecast `weather` entity** · away-mode / peak-control switches · peak-limit number · refresh button |
@@ -51,6 +51,9 @@ each vehicle:
   optimistic — it reads the stored value back).
 - **Departure Monday … Departure Sunday** — seven `time` entities, one per weekday.
   Setting one writes `"HH:MM"` back via `setVehicleSettings`.
+- **Clear all departure times** — a vehicle button that clears only weekdays
+  currently containing a time. Tibber requires one explicit GraphQL `null`
+  mutation per weekday; empty weekdays are skipped.
 
 Both settings are **namespaced by how the vehicle was added**: manually added
 vehicles use `offline.vehicle.smartCharging.isEnabled` /
@@ -71,6 +74,23 @@ So the weekly schedule is just the seven `time.<vehicle>_departure_<weekday>`
 entities; automate or adjust them like any other HA time helper. (Target
 state-of-charge is reported by the *Target charge* sensor; the app exposes no
 writable per-day SoC setting, only the departure times.)
+
+Home Assistant's standard `time.set_value` action only accepts a real time, so
+it cannot restore Tibber's *No departure time* state. Better Tibber therefore
+adds the `tibber_app.clear_departure_times` action. Target one or more of the
+vehicle's departure `time` entities:
+
+```yaml
+action: tibber_app.clear_departure_times
+target:
+  entity_id:
+    - time.my_car_departure_monday
+    - time.my_car_departure_tuesday
+```
+
+The selected entities identify both the vehicle and weekdays; no Tibber vehicle
+ID or Home Assistant device ID is required. Use the vehicle's *Clear all
+departure times* button when the entire weekly schedule should be emptied.
 
 \* Phase voltages/currents and signal strength are disabled by default — enable
 them per entity if you want them.

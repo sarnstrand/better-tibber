@@ -99,7 +99,8 @@
       "peak_control": { "name": "Peak control" }
     },
     "button": {
-      "refresh": { "name": "Refresh" }
+      "refresh": { "name": "Refresh" },
+      "clear_all_departure_times": { "name": "Clear all departure times" }
     }
   }
 }

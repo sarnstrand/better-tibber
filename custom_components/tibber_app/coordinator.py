@@ -443,6 +443,27 @@ class TibberDataUpdateCoordinator(DataUpdateCoordinator[TibberData]):
         )
         await self.async_request_refresh()
 
+    async def async_clear_vehicle_departure_times(
+        self, vehicle_id: str, home_id: str, setting_keys: list[str]
+    ) -> None:
+        """Clear departure settings one per request, then refresh once.
+
+        Tibber's Android app clears a departure time with one explicit null
+        value per mutation. Sending several null settings in one mutation is
+        accepted by the backend but does not clear existing times.
+        """
+        for key in dict.fromkeys(setting_keys):
+            await self.client.gql(
+                queries.SET_VEHICLE_SETTINGS,
+                {
+                    "vehicleId": vehicle_id,
+                    "homeId": home_id,
+                    "settings": [{"key": key, "value": None}],
+                },
+            )
+        if setting_keys:
+            await self.async_request_refresh()
+
     async def async_set_charger_setting(
         self, charger_id: str, home_id: str, key: str, value: Any
     ) -> None:

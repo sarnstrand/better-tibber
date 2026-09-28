@@ -13,7 +13,8 @@ Home Assistant.
 
 - **Vehicles** — battery %, range, charging status, session energy/cost, manual
   state-of-charge, smart-charging toggle and a **weekly departure schedule** (a
-  `time` entity per weekday).
+  `time` entity per weekday), including selective and clear-all removal of
+  departure times.
 - **Chargers** — status, preferred-vehicle selector, cable lock, load balancing,
   fuse/current settings.
 - **Live meter (Pulse)** — power, production, per-phase current/voltage and running
